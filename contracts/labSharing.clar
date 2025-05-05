@@ -124,3 +124,78 @@
 (define-read-only (get-user-balance (user principal))
   (ok (default-to u0 (map-get? user-balances user)))
 )
+
+(define-map resource-ratings
+  {resource-id: uint, user: principal}
+  {rating: uint, timestamp: uint}
+)
+
+(define-map resource-average-rating
+  uint
+  {total-ratings: uint, average-score: uint}
+)
+
+(define-constant err-invalid-rating (err u106))
+(define-constant err-not-booked (err u107))
+
+(define-public (rate-resource (resource-id uint) (rating uint))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (current-average (default-to {total-ratings: u0, average-score: u0} 
+      (map-get? resource-average-rating resource-id)))
+  )
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (map-set resource-ratings
+      {resource-id: resource-id, user: tx-sender}
+      {rating: rating, timestamp: stacks-block-height}
+    )
+    (map-set resource-average-rating
+      resource-id
+      {
+        total-ratings: (+ (get total-ratings current-average) u1),
+        average-score: (/ (+ (* (get total-ratings current-average) 
+                               (get average-score current-average)) 
+                            rating)
+                         (+ (get total-ratings current-average) u1))
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-resource-rating (resource-id uint))
+  (ok (map-get? resource-average-rating resource-id))
+)
+
+
+(define-map maintenance-schedule
+  {resource-id: uint, start-time: uint}
+  {duration: uint, reason: (string-ascii 100)}
+)
+
+(define-constant err-maintenance-conflict (err u108))
+
+(define-public (schedule-maintenance 
+    (resource-id uint) 
+    (start-time uint) 
+    (duration uint) 
+    (reason (string-ascii 100))
+  )
+  (let ((resource (unwrap! (map-get? lab-resources resource-id) err-not-found)))
+    (asserts! (is-eq (get owner resource) tx-sender) err-owner-only)
+    (asserts! (> duration u0) err-invalid-time)
+    (map-set maintenance-schedule
+      {resource-id: resource-id, start-time: start-time}
+      {duration: duration, reason: reason}
+    )
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: false})
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-maintenance-schedule (resource-id uint) (start-time uint))
+  (ok (map-get? maintenance-schedule {resource-id: resource-id, start-time: start-time}))
+)
