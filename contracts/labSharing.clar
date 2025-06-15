@@ -6,6 +6,20 @@
 (define-constant err-insufficient-balance (err u104))
 (define-constant err-invalid-time (err u105))
 
+(define-constant err-cancellation-too-late (err u109))
+(define-constant err-already-cancelled (err u110))
+(define-constant cancellation-window u24)
+
+(define-map cancelled-bookings
+  {resource-id: uint, time-slot: uint}
+  {
+    cancelled-by: principal,
+    cancellation-time: uint,
+    refund-amount: uint,
+    reason: (string-ascii 100)
+  }
+)
+
 (define-non-fungible-token lab-resource uint)
 
 (define-map lab-resources
@@ -198,4 +212,116 @@
 
 (define-read-only (get-maintenance-schedule (resource-id uint) (start-time uint))
   (ok (map-get? maintenance-schedule {resource-id: resource-id, start-time: start-time}))
+)
+
+
+(define-public (cancel-maintenance (resource-id uint) (start-time uint))
+  (let ((maintenance (unwrap! (map-get? maintenance-schedule {resource-id: resource-id, start-time: start-time}) err-not-found)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-delete maintenance-schedule {resource-id: resource-id, start-time: start-time})
+    (let ((resource (unwrap! (map-get? lab-resources resource-id) err-not-found)))
+      (map-set lab-resources
+        resource-id
+        (merge resource {available: true})
+      )
+    )
+    (ok true)
+  )
+)
+
+
+
+(define-public (cancel-booking-user (resource-id uint) (time-slot uint))
+  (let (
+    (booking (unwrap! (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot}) err-not-found))
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (current-balance (default-to u0 (map-get? user-balances tx-sender)))
+  )
+    (asserts! (is-eq (get user booking) tx-sender) err-unauthorized)
+    (asserts! (is-none (map-get? cancelled-bookings {resource-id: resource-id, time-slot: time-slot})) err-already-cancelled)
+    (asserts! (>= (- time-slot stacks-block-height) cancellation-window) err-cancellation-too-late)
+    
+    (map-set cancelled-bookings
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        cancelled-by: tx-sender,
+        cancellation-time: stacks-block-height,
+        refund-amount: (get paid-amount booking),
+        reason: "User cancellation"
+      }
+    )
+    
+    (map-set user-balances
+      tx-sender
+      (+ current-balance (get paid-amount booking))
+    )
+    
+    (map-delete resource-bookings {resource-id: resource-id, time-slot: time-slot})
+    
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: true})
+    )
+    
+    (ok (get paid-amount booking))
+  )
+)
+
+(define-public (cancel-booking-owner (resource-id uint) (time-slot uint) (reason (string-ascii 100)))
+  (let (
+    (booking (unwrap! (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot}) err-not-found))
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (user-balance (default-to u0 (map-get? user-balances (get user booking))))
+  )
+    (asserts! (is-eq (get owner resource) tx-sender) err-owner-only)
+    (asserts! (is-none (map-get? cancelled-bookings {resource-id: resource-id, time-slot: time-slot})) err-already-cancelled)
+    
+    (map-set cancelled-bookings
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        cancelled-by: tx-sender,
+        cancellation-time: stacks-block-height,
+        refund-amount: (get paid-amount booking),
+        reason: reason
+      }
+    )
+    
+    (map-set user-balances
+      (get user booking)
+      (+ user-balance (get paid-amount booking))
+    )
+    
+    (map-delete resource-bookings {resource-id: resource-id, time-slot: time-slot})
+    
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: true})
+    )
+    
+    (ok (get paid-amount booking))
+  )
+)
+
+(define-read-only (get-cancellation-info (resource-id uint) (time-slot uint))
+  (ok (map-get? cancelled-bookings {resource-id: resource-id, time-slot: time-slot}))
+)
+
+(define-read-only (can-cancel-booking (resource-id uint) (time-slot uint) (user principal))
+  (let (
+    (booking (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot}))
+    (is-cancelled (is-some (map-get? cancelled-bookings {resource-id: resource-id, time-slot: time-slot})))
+  )
+    (ok 
+      (and 
+        (is-some booking)
+        (not is-cancelled)
+        (is-eq (get user (unwrap-panic booking)) user)
+        (>= (- time-slot stacks-block-height) cancellation-window)
+      )
+    )
+  )
+)
+
+(define-read-only (get-cancellation-deadline (time-slot uint))
+  (ok (- time-slot cancellation-window))
 )
