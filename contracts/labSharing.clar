@@ -10,6 +10,79 @@
 (define-constant err-already-cancelled (err u110))
 (define-constant cancellation-window u24)
 
+
+
+(define-constant bid-expiry-blocks u144)
+(define-constant offer-expiry-blocks u144)
+(define-constant err-bid-expired (err u111))
+(define-constant err-offer-expired (err u112))
+(define-constant err-bid-exists (err u113))
+(define-constant err-offer-exists (err u114))
+(define-constant err-invalid-bid (err u115))
+(define-constant err-invalid-offer (err u116))
+(define-constant err-cannot-bid-own-resource (err u117))
+(define-constant err-offer-not-found (err u118))
+(define-constant err-bid-not-found (err u119))
+(define-constant err-offer-too-low (err u120))
+
+(define-map resource-bids
+  {resource-id: uint, time-slot: uint, bidder: principal}
+  {
+    bid-amount: uint,
+    duration: uint,
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map resource-offers
+  {resource-id: uint, time-slot: uint, offerer: principal}
+  {
+    offer-amount: uint,
+    duration: uint,
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map highest-bid
+  {resource-id: uint, time-slot: uint}
+  {
+    bidder: principal,
+    amount: uint,
+    duration: uint
+  }
+)
+
+(define-map lowest-offer
+  {resource-id: uint, time-slot: uint}
+  {
+    offerer: principal,
+    amount: uint,
+    duration: uint
+  }
+)
+
+(define-map user-bid-history
+  {user: principal, resource-id: uint}
+  {
+    total-bids: uint,
+    successful-bids: uint,
+    average-bid: uint
+  }
+)
+
+(define-map user-offer-history
+  {user: principal, resource-id: uint}
+  {
+    total-offers: uint,
+    successful-offers: uint,
+    average-offer: uint
+  }
+)
+
 (define-map cancelled-bookings
   {resource-id: uint, time-slot: uint}
   {
@@ -324,4 +397,303 @@
 
 (define-read-only (get-cancellation-deadline (time-slot uint))
   (ok (- time-slot cancellation-window))
+)
+
+
+(define-public (place-bid (resource-id uint) (time-slot uint) (bid-amount uint) (duration uint))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    (existing-bid (map-get? resource-bids {resource-id: resource-id, time-slot: time-slot, bidder: tx-sender}))
+    (current-highest (map-get? highest-bid {resource-id: resource-id, time-slot: time-slot}))
+    (expires-at (+ stacks-block-height bid-expiry-blocks))
+    (bid-history (default-to {total-bids: u0, successful-bids: u0, average-bid: u0} 
+      (map-get? user-bid-history {user: tx-sender, resource-id: resource-id})))
+  )
+    (asserts! (not (is-eq (get owner resource) tx-sender)) err-cannot-bid-own-resource)
+    (asserts! (> bid-amount u0) err-invalid-bid)
+    (asserts! (> duration u0) err-invalid-time)
+    (asserts! (>= user-balance bid-amount) err-insufficient-balance)
+    (asserts! (is-none existing-bid) err-bid-exists)
+    (asserts! (is-none (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot})) err-already-exists)
+    
+    (map-set resource-bids
+      {resource-id: resource-id, time-slot: time-slot, bidder: tx-sender}
+      {
+        bid-amount: bid-amount,
+        duration: duration,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        status: "active"
+      }
+    )
+    
+    (map-set user-balances
+      tx-sender
+      (- user-balance bid-amount)
+    )
+    
+    (if (or (is-none current-highest) (> bid-amount (get amount (unwrap-panic current-highest))))
+      (map-set highest-bid
+        {resource-id: resource-id, time-slot: time-slot}
+        {
+          bidder: tx-sender,
+          amount: bid-amount,
+          duration: duration
+        }
+      )
+      true
+    )
+    
+    (map-set user-bid-history
+      {user: tx-sender, resource-id: resource-id}
+      {
+        total-bids: (+ (get total-bids bid-history) u1),
+        successful-bids: (get successful-bids bid-history),
+        average-bid: (/ (+ (* (get total-bids bid-history) (get average-bid bid-history)) bid-amount)
+                       (+ (get total-bids bid-history) u1))
+      }
+    )
+    
+    (ok bid-amount)
+  )
+)
+
+(define-public (place-offer (resource-id uint) (time-slot uint) (offer-amount uint) (duration uint))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    (existing-offer (map-get? resource-offers {resource-id: resource-id, time-slot: time-slot, offerer: tx-sender}))
+    (current-lowest (map-get? lowest-offer {resource-id: resource-id, time-slot: time-slot}))
+    (expires-at (+ stacks-block-height offer-expiry-blocks))
+    (offer-history (default-to {total-offers: u0, successful-offers: u0, average-offer: u0} 
+      (map-get? user-offer-history {user: tx-sender, resource-id: resource-id})))
+  )
+    (asserts! (not (is-eq (get owner resource) tx-sender)) err-cannot-bid-own-resource)
+    (asserts! (> offer-amount u0) err-invalid-offer)
+    (asserts! (> duration u0) err-invalid-time)
+    (asserts! (>= user-balance offer-amount) err-insufficient-balance)
+    (asserts! (is-none existing-offer) err-offer-exists)
+    (asserts! (is-none (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot})) err-already-exists)
+    
+    (map-set resource-offers
+      {resource-id: resource-id, time-slot: time-slot, offerer: tx-sender}
+      {
+        offer-amount: offer-amount,
+        duration: duration,
+        created-at: stacks-block-height,
+        expires-at: expires-at,
+        status: "active"
+      }
+    )
+    
+    (map-set user-balances
+      tx-sender
+      (- user-balance offer-amount)
+    )
+    
+    (if (or (is-none current-lowest) (< offer-amount (get amount (unwrap-panic current-lowest))))
+      (map-set lowest-offer
+        {resource-id: resource-id, time-slot: time-slot}
+        {
+          offerer: tx-sender,
+          amount: offer-amount,
+          duration: duration
+        }
+      )
+      true
+    )
+    
+    (map-set user-offer-history
+      {user: tx-sender, resource-id: resource-id}
+      {
+        total-offers: (+ (get total-offers offer-history) u1),
+        successful-offers: (get successful-offers offer-history),
+        average-offer: (/ (+ (* (get total-offers offer-history) (get average-offer offer-history)) offer-amount)
+                         (+ (get total-offers offer-history) u1))
+      }
+    )
+    
+    (ok offer-amount)
+  )
+)
+
+(define-public (accept-bid (resource-id uint) (time-slot uint) (bidder principal))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (bid (unwrap! (map-get? resource-bids {resource-id: resource-id, time-slot: time-slot, bidder: bidder}) err-bid-not-found))
+    (bid-history (default-to {total-bids: u0, successful-bids: u0, average-bid: u0} 
+      (map-get? user-bid-history {user: bidder, resource-id: resource-id})))
+    (resource-owner-balance (default-to u0 (map-get? user-balances (get owner resource))))
+  )
+    (asserts! (is-eq (get owner resource) tx-sender) err-owner-only)
+    (asserts! (is-eq (get status bid) "active") err-unauthorized)
+    (asserts! (>= (get expires-at bid) stacks-block-height) err-bid-expired)
+    
+    (map-set resource-bookings
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        user: bidder,
+        duration: (get duration bid),
+        paid-amount: (get bid-amount bid)
+      }
+    )
+    
+    (map-set user-balances
+      (get owner resource)
+      (+ resource-owner-balance (get bid-amount bid))
+    )
+    
+    (map-set resource-bids
+      {resource-id: resource-id, time-slot: time-slot, bidder: bidder}
+      (merge bid {status: "accepted"})
+    )
+    
+    (map-set user-bid-history
+      {user: bidder, resource-id: resource-id}
+      {
+        total-bids: (get total-bids bid-history),
+        successful-bids: (+ (get successful-bids bid-history) u1),
+        average-bid: (get average-bid bid-history)
+      }
+    )
+    
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: false})
+    )
+    
+    (ok (get bid-amount bid))
+  )
+)
+
+(define-public (accept-offer (resource-id uint) (time-slot uint) (offerer principal))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (offer (unwrap! (map-get? resource-offers {resource-id: resource-id, time-slot: time-slot, offerer: offerer}) err-offer-not-found))
+    (offer-history (default-to {total-offers: u0, successful-offers: u0, average-offer: u0} 
+      (map-get? user-offer-history {user: offerer, resource-id: resource-id})))
+    (resource-owner-balance (default-to u0 (map-get? user-balances (get owner resource))))
+  )
+    (asserts! (is-eq (get owner resource) tx-sender) err-owner-only)
+    (asserts! (is-eq (get status offer) "active") err-unauthorized)
+    (asserts! (>= (get expires-at offer) stacks-block-height) err-offer-expired)
+    
+    (map-set resource-bookings
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        user: offerer,
+        duration: (get duration offer),
+        paid-amount: (get offer-amount offer)
+      }
+    )
+    
+    (map-set user-balances
+      (get owner resource)
+      (+ resource-owner-balance (get offer-amount offer))
+    )
+    
+    (map-set resource-offers
+      {resource-id: resource-id, time-slot: time-slot, offerer: offerer}
+      (merge offer {status: "accepted"})
+    )
+    
+    (map-set user-offer-history
+      {user: offerer, resource-id: resource-id}
+      {
+        total-offers: (get total-offers offer-history),
+        successful-offers: (+ (get successful-offers offer-history) u1),
+        average-offer: (get average-offer offer-history)
+      }
+    )
+    
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: false})
+    )
+    
+    (ok (get offer-amount offer))
+  )
+)
+
+(define-public (cancel-bid (resource-id uint) (time-slot uint))
+  (let (
+    (bid (unwrap! (map-get? resource-bids {resource-id: resource-id, time-slot: time-slot, bidder: tx-sender}) err-bid-not-found))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+  )
+    (asserts! (is-eq (get status bid) "active") err-unauthorized)
+    
+    (map-set resource-bids
+      {resource-id: resource-id, time-slot: time-slot, bidder: tx-sender}
+      (merge bid {status: "cancelled"})
+    )
+    
+    (map-set user-balances
+      tx-sender
+      (+ user-balance (get bid-amount bid))
+    )
+    
+    (ok (get bid-amount bid))
+  )
+)
+
+(define-public (cancel-offer (resource-id uint) (time-slot uint))
+  (let (
+    (offer (unwrap! (map-get? resource-offers {resource-id: resource-id, time-slot: time-slot, offerer: tx-sender}) err-offer-not-found))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+  )
+    (asserts! (is-eq (get status offer) "active") err-unauthorized)
+    
+    (map-set resource-offers
+      {resource-id: resource-id, time-slot: time-slot, offerer: tx-sender}
+      (merge offer {status: "cancelled"})
+    )
+    
+    (map-set user-balances
+      tx-sender
+      (+ user-balance (get offer-amount offer))
+    )
+    
+    (ok (get offer-amount offer))
+  )
+)
+
+(define-read-only (get-resource-bid (resource-id uint) (time-slot uint) (bidder principal))
+  (ok (map-get? resource-bids {resource-id: resource-id, time-slot: time-slot, bidder: bidder}))
+)
+
+(define-read-only (get-resource-offer (resource-id uint) (time-slot uint) (offerer principal))
+  (ok (map-get? resource-offers {resource-id: resource-id, time-slot: time-slot, offerer: offerer}))
+)
+
+(define-read-only (get-highest-bid (resource-id uint) (time-slot uint))
+  (ok (map-get? highest-bid {resource-id: resource-id, time-slot: time-slot}))
+)
+
+(define-read-only (get-lowest-offer (resource-id uint) (time-slot uint))
+  (ok (map-get? lowest-offer {resource-id: resource-id, time-slot: time-slot}))
+)
+
+(define-read-only (get-user-bid-history (user principal) (resource-id uint))
+  (ok (map-get? user-bid-history {user: user, resource-id: resource-id}))
+)
+
+(define-read-only (get-user-offer-history (user principal) (resource-id uint))
+  (ok (map-get? user-offer-history {user: user, resource-id: resource-id}))
+)
+
+(define-read-only (get-marketplace-stats (resource-id uint) (time-slot uint))
+  (let (
+    (highest (map-get? highest-bid {resource-id: resource-id, time-slot: time-slot}))
+    (lowest (map-get? lowest-offer {resource-id: resource-id, time-slot: time-slot}))
+  )
+    (ok {
+      highest-bid: highest,
+      lowest-offer: lowest,
+      spread: (if (and (is-some highest) (is-some lowest))
+        (some (- (get amount (unwrap-panic lowest)) (get amount (unwrap-panic highest))))
+        none
+      )
+    })
+  )
 )
