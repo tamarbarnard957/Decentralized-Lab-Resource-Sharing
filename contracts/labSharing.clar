@@ -697,3 +697,325 @@
     })
   )
 )
+
+;; Collaborative Sessions Feature - enables multiple users to share expensive lab equipment and split costs
+(define-constant err-session-full (err u121))
+(define-constant err-session-not-found (err u122))
+(define-constant err-already-in-session (err u123))
+(define-constant err-session-started (err u124))
+(define-constant err-session-not-started (err u125))
+(define-constant err-not-session-creator (err u126))
+(define-constant err-not-in-session (err u127))
+(define-constant err-session-ended (err u128))
+(define-constant err-invalid-capacity (err u129))
+
+;; Map to store collaborative session details
+(define-map collaborative-sessions
+  {resource-id: uint, time-slot: uint}
+  {
+    creator: principal,
+    max-participants: uint,
+    current-participants: uint,
+    cost-per-participant: uint,
+    duration: uint,
+    status: (string-ascii 20), ;; "open", "started", "ended"
+    created-at: uint
+  }
+)
+
+;; Map to track participants in each session
+(define-map session-participants
+  {resource-id: uint, time-slot: uint, participant: principal}
+  {
+    joined-at: uint,
+    contribution: uint,
+    active: bool
+  }
+)
+
+;; Map to track user's session history
+(define-map user-session-stats
+  principal
+  {
+    sessions-created: uint,
+    sessions-joined: uint,
+    total-contributions: uint,
+    collaborative-hours: uint
+  }
+)
+
+;; Map to store session completion data
+(define-map session-completion
+  {resource-id: uint, time-slot: uint}
+  {
+    completed-at: uint,
+    total-cost: uint,
+    participants-count: uint,
+    duration-used: uint
+  }
+)
+
+;; Create a new collaborative session for a resource
+(define-public (create-collaborative-session 
+  (resource-id uint) 
+  (time-slot uint) 
+  (max-participants uint) 
+  (duration uint))
+  (let (
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (existing-booking (map-get? resource-bookings {resource-id: resource-id, time-slot: time-slot}))
+    (existing-session (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}))
+    (hourly-rate (get hourly-rate resource))
+    (total-cost (* hourly-rate duration))
+    (cost-per-participant (/ total-cost max-participants))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    (user-stats (default-to {sessions-created: u0, sessions-joined: u0, total-contributions: u0, collaborative-hours: u0} 
+      (map-get? user-session-stats tx-sender)))
+  )
+    ;; Validate inputs and state
+    (asserts! (get available resource) err-unauthorized)
+    (asserts! (is-none existing-booking) err-already-exists)
+    (asserts! (is-none existing-session) err-already-exists)
+    (asserts! (and (> max-participants u1) (<= max-participants u10)) err-invalid-capacity)
+    (asserts! (> duration u0) err-invalid-time)
+    (asserts! (>= user-balance cost-per-participant) err-insufficient-balance)
+    
+    ;; Create the collaborative session
+    (map-set collaborative-sessions
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        creator: tx-sender,
+        max-participants: max-participants,
+        current-participants: u1,
+        cost-per-participant: cost-per-participant,
+        duration: duration,
+        status: "open",
+        created-at: stacks-block-height
+      }
+    )
+    
+    ;; Add creator as first participant
+    (map-set session-participants
+      {resource-id: resource-id, time-slot: time-slot, participant: tx-sender}
+      {
+        joined-at: stacks-block-height,
+        contribution: cost-per-participant,
+        active: true
+      }
+    )
+    
+    ;; Deduct cost from creator's balance
+    (map-set user-balances
+      tx-sender
+      (- user-balance cost-per-participant)
+    )
+    
+    ;; Update user statistics
+    (map-set user-session-stats
+      tx-sender
+      {
+        sessions-created: (+ (get sessions-created user-stats) u1),
+        sessions-joined: (+ (get sessions-joined user-stats) u1),
+        total-contributions: (+ (get total-contributions user-stats) cost-per-participant),
+        collaborative-hours: (+ (get collaborative-hours user-stats) duration)
+      }
+    )
+    
+    (ok cost-per-participant)
+  )
+)
+
+;; Join an existing collaborative session
+(define-public (join-collaborative-session (resource-id uint) (time-slot uint))
+  (let (
+    (session (unwrap! (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}) err-session-not-found))
+    (existing-participant (map-get? session-participants {resource-id: resource-id, time-slot: time-slot, participant: tx-sender}))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    (cost-per-participant (get cost-per-participant session))
+    (user-stats (default-to {sessions-created: u0, sessions-joined: u0, total-contributions: u0, collaborative-hours: u0} 
+      (map-get? user-session-stats tx-sender)))
+  )
+    ;; Validate session state and user eligibility
+    (asserts! (is-eq (get status session) "open") err-session-started)
+    (asserts! (< (get current-participants session) (get max-participants session)) err-session-full)
+    (asserts! (is-none existing-participant) err-already-in-session)
+    (asserts! (>= user-balance cost-per-participant) err-insufficient-balance)
+    
+    ;; Add user as participant
+    (map-set session-participants
+      {resource-id: resource-id, time-slot: time-slot, participant: tx-sender}
+      {
+        joined-at: stacks-block-height,
+        contribution: cost-per-participant,
+        active: true
+      }
+    )
+    
+    ;; Update session participant count
+    (map-set collaborative-sessions
+      {resource-id: resource-id, time-slot: time-slot}
+      (merge session {current-participants: (+ (get current-participants session) u1)})
+    )
+    
+    ;; Deduct cost from user's balance
+    (map-set user-balances
+      tx-sender
+      (- user-balance cost-per-participant)
+    )
+    
+    ;; Update user statistics
+    (map-set user-session-stats
+      tx-sender
+      {
+        sessions-created: (get sessions-created user-stats),
+        sessions-joined: (+ (get sessions-joined user-stats) u1),
+        total-contributions: (+ (get total-contributions user-stats) cost-per-participant),
+        collaborative-hours: (+ (get collaborative-hours user-stats) (get duration session))
+      }
+    )
+    
+    (ok cost-per-participant)
+  )
+)
+
+;; Start a collaborative session (only creator can start)
+(define-public (start-collaborative-session (resource-id uint) (time-slot uint))
+  (let (
+    (session (unwrap! (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}) err-session-not-found))
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+  )
+    ;; Validate permissions and state
+    (asserts! (is-eq (get creator session) tx-sender) err-not-session-creator)
+    (asserts! (is-eq (get status session) "open") err-session-started)
+    
+    ;; Update session status to started
+    (map-set collaborative-sessions
+      {resource-id: resource-id, time-slot: time-slot}
+      (merge session {status: "started"})
+    )
+    
+    ;; Mark resource as unavailable
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: false})
+    )
+    
+    (ok true)
+  )
+)
+
+;; Complete a collaborative session and distribute payments
+(define-public (complete-collaborative-session (resource-id uint) (time-slot uint))
+  (let (
+    (session (unwrap! (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}) err-session-not-found))
+    (resource (unwrap! (map-get? lab-resources resource-id) err-not-found))
+    (total-collected (* (get cost-per-participant session) (get current-participants session)))
+    (owner-balance (default-to u0 (map-get? user-balances (get owner resource))))
+  )
+    ;; Validate permissions and state
+    (asserts! (or (is-eq (get creator session) tx-sender) (is-eq (get owner resource) tx-sender)) err-unauthorized)
+    (asserts! (is-eq (get status session) "started") err-session-not-started)
+    
+    ;; Record session completion
+    (map-set session-completion
+      {resource-id: resource-id, time-slot: time-slot}
+      {
+        completed-at: stacks-block-height,
+        total-cost: total-collected,
+        participants-count: (get current-participants session),
+        duration-used: (get duration session)
+      }
+    )
+    
+    ;; Update session status to ended
+    (map-set collaborative-sessions
+      {resource-id: resource-id, time-slot: time-slot}
+      (merge session {status: "ended"})
+    )
+    
+    ;; Transfer collected funds to resource owner
+    (map-set user-balances
+      (get owner resource)
+      (+ owner-balance total-collected)
+    )
+    
+    ;; Mark resource as available again
+    (map-set lab-resources
+      resource-id
+      (merge resource {available: true})
+    )
+    
+    (ok total-collected)
+  )
+)
+
+;; Leave a collaborative session (only before it starts)
+(define-public (leave-collaborative-session (resource-id uint) (time-slot uint))
+  (let (
+    (session (unwrap! (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}) err-session-not-found))
+    (participant (unwrap! (map-get? session-participants {resource-id: resource-id, time-slot: time-slot, participant: tx-sender}) err-not-in-session))
+    (user-balance (default-to u0 (map-get? user-balances tx-sender)))
+    (refund-amount (get contribution participant))
+  )
+    ;; Validate session state
+    (asserts! (is-eq (get status session) "open") err-session-started)
+    (asserts! (get active participant) err-unauthorized)
+    
+    ;; Mark participant as inactive
+    (map-set session-participants
+      {resource-id: resource-id, time-slot: time-slot, participant: tx-sender}
+      (merge participant {active: false})
+    )
+    
+    ;; Update session participant count
+    (map-set collaborative-sessions
+      {resource-id: resource-id, time-slot: time-slot}
+      (merge session {current-participants: (- (get current-participants session) u1)})
+    )
+    
+    ;; Refund user's contribution
+    (map-set user-balances
+      tx-sender
+      (+ user-balance refund-amount)
+    )
+    
+    (ok refund-amount)
+  )
+)
+
+;; Read-only functions for collaborative sessions
+
+(define-read-only (get-collaborative-session (resource-id uint) (time-slot uint))
+  (ok (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}))
+)
+
+(define-read-only (get-session-participant (resource-id uint) (time-slot uint) (participant principal))
+  (ok (map-get? session-participants {resource-id: resource-id, time-slot: time-slot, participant: participant}))
+)
+
+(define-read-only (get-user-session-stats (user principal))
+  (ok (map-get? user-session-stats user))
+)
+
+(define-read-only (get-session-completion (resource-id uint) (time-slot uint))
+  (ok (map-get? session-completion {resource-id: resource-id, time-slot: time-slot}))
+)
+
+(define-read-only (is-session-available (resource-id uint) (time-slot uint))
+  (let (
+    (session (map-get? collaborative-sessions {resource-id: resource-id, time-slot: time-slot}))
+  )
+    (ok 
+      (if (is-some session)
+        (let ((session-data (unwrap-panic session)))
+          (and 
+            (is-eq (get status session-data) "open")
+            (< (get current-participants session-data) (get max-participants session-data))
+          )
+        )
+        false
+      )
+    )
+  )
+)
+
